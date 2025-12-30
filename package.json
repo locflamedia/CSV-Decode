@@ -1,0 +1,16 @@
+{
+  "name": "csv-decoder",
+  "version": "1.0.0",
+  "description": "Decode and fix encoding for all CSV files",
+  "main": "decode-csv.js",
+  "scripts": {
+    "start": "node decode-csv.js"
+  },
+  "keywords": ["csv", "encoding", "utf8", "decode"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "iconv-lite": "^0.6.3",
+    "csv-parser": "^3.0.0"
+  }
+}
