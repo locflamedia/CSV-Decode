@@ -3,13 +3,43 @@ const path = require('path');
 const iconv = require('iconv-lite');
 
 const OUTPUT_DIR = 'decoded-csv';
+const MAX_UTF8_REPLACEMENTS = 10;
+
+function countReplacementChars(text) {
+  return (text.match(/\ufffd/g) || []).length;
+}
+
+function looksLikeUtf16Le(buffer) {
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return true;
+  }
+
+  const sampleLength = Math.min(buffer.length, 4096);
+  let pairs = 0;
+  let evenNulls = 0;
+  let oddNulls = 0;
+
+  for (let i = 0; i + 1 < sampleLength; i += 2) {
+    pairs++;
+    if (buffer[i] === 0) {
+      evenNulls++;
+    }
+    if (buffer[i + 1] === 0) {
+      oddNulls++;
+    }
+  }
+
+  return pairs > 0 && oddNulls / pairs > 0.3 && evenNulls / pairs < 0.05;
+}
 
 function detectEncoding(buffer) {
   // Try to detect if the file is already UTF-8
   try {
     const decoded = iconv.decode(buffer, 'utf8');
-    // Check if it's valid UTF-8 without replacement characters
-    if (!decoded.includes('\ufffd')) {
+    const replacementCount = countReplacementChars(decoded);
+    // Keep mostly-valid UTF-8 files as UTF-8. A few bad bytes should not make
+    // the whole file fall through to single-byte or UTF-16 guesses.
+    if (replacementCount <= MAX_UTF8_REPLACEMENTS) {
       return 'utf8';
     }
   } catch (e) {
@@ -17,7 +47,7 @@ function detectEncoding(buffer) {
   }
 
   const encodings = [
-    'utf16le',
+    ...(looksLikeUtf16Le(buffer) ? ['utf16le'] : []),
     'windows-1252',
     'iso-8859-1',
     'windows-1251',
@@ -46,47 +76,98 @@ function decodeUnicodeEscapes(text) {
   });
 }
 
+function detectEncodingFromSample(filePath) {
+  const SAMPLE_SIZE = 65536; // 64KB sample
+  const fd = fs.openSync(filePath, 'r');
+  const buffer = Buffer.alloc(SAMPLE_SIZE);
+  const bytesRead = fs.readSync(fd, buffer, 0, SAMPLE_SIZE, 0);
+  fs.closeSync(fd);
+
+  const sample = buffer.slice(0, bytesRead);
+  return detectEncoding(sample);
+}
+
 function decodeCSVFile(filePath) {
-  try {
-    console.log(`\nProcessing: ${filePath}`);
+  return new Promise((resolve, reject) => {
+    try {
+      console.log(`\nProcessing: ${filePath}`);
 
-    const buffer = fs.readFileSync(filePath);
+      const detectedEncoding = detectEncodingFromSample(filePath);
+      console.log(`  Detected encoding: ${detectedEncoding}`);
 
-    // Always try UTF-8 first since it's the most common
-    let decoded = buffer.toString('utf8');
-    let detectedEncoding = 'utf8';
+      if (!fs.existsSync(OUTPUT_DIR)) {
+        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+      }
 
-    // Check if decoded text has replacement characters (invalid UTF-8)
-    if (decoded.includes('\ufffd')) {
-      detectedEncoding = detectEncoding(buffer);
-      decoded = iconv.decode(buffer, detectedEncoding);
+      const fileName = path.basename(filePath);
+      const outputPath = path.join(OUTPUT_DIR, fileName);
+
+      const readStream = fs.createReadStream(filePath);
+      const decodeStream = iconv.decodeStream(detectedEncoding);
+      const writeStream = fs.createWriteStream(outputPath, { encoding: 'utf8' });
+
+      let hasUnicodeEscapes = false;
+      let chunkBuffer = '';
+
+      decodeStream.on('data', (chunk) => {
+        chunkBuffer += chunk;
+
+        // Process in lines to handle unicode escapes properly
+        const lines = chunkBuffer.split('\n');
+        chunkBuffer = lines.pop(); // Keep incomplete line in buffer
+
+        for (let line of lines) {
+          if (!hasUnicodeEscapes && line.includes('\\u')) {
+            hasUnicodeEscapes = true;
+          }
+          if (hasUnicodeEscapes) {
+            line = decodeUnicodeEscapes(line);
+          }
+          writeStream.write(line + '\n');
+        }
+      });
+
+      decodeStream.on('end', () => {
+        // Write remaining buffer
+        if (chunkBuffer) {
+          if (hasUnicodeEscapes) {
+            chunkBuffer = decodeUnicodeEscapes(chunkBuffer);
+          }
+          writeStream.write(chunkBuffer);
+        }
+        writeStream.end();
+      });
+
+      writeStream.on('finish', () => {
+        if (hasUnicodeEscapes) {
+          console.log(`  ✓ Decoded Unicode escapes`);
+        }
+        console.log(`  ✓ Successfully decoded to: ${outputPath}`);
+        resolve(true);
+      });
+
+      writeStream.on('error', (error) => {
+        console.error(`  ✗ Error writing ${outputPath}:`, error.message);
+        reject(error);
+      });
+
+      readStream.on('error', (error) => {
+        console.error(`  ✗ Error reading ${filePath}:`, error.message);
+        reject(error);
+      });
+
+      decodeStream.on('error', (error) => {
+        console.error(`  ✗ Error decoding ${filePath}:`, error.message);
+        reject(error);
+      });
+
+      readStream.pipe(decodeStream);
+
+    } catch (error) {
+      console.error(`  ✗ Error processing ${filePath}:`, error.message);
+      reject(error);
     }
-
-    console.log(`  Detected encoding: ${detectedEncoding}`);
-
-    const unicodeEscapeCount = (decoded.match(/\\u[\dA-Fa-f]{4}/g) || []).length;
-    if (unicodeEscapeCount > 0) {
-      console.log(`  Found ${unicodeEscapeCount} Unicode escape sequences`);
-      decoded = decodeUnicodeEscapes(decoded);
-      console.log(`  ✓ Decoded Unicode escapes`);
-    }
-
-    if (!fs.existsSync(OUTPUT_DIR)) {
-      fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-    }
-
-    const fileName = path.basename(filePath);
-    const outputPath = path.join(OUTPUT_DIR, fileName);
-
-    fs.writeFileSync(outputPath, decoded, 'utf8');
-
-    console.log(`  ✓ Successfully decoded to: ${outputPath}`);
-
-    return true;
-  } catch (error) {
-    console.error(`  ✗ Error processing ${filePath}:`, error.message);
-    return false;
-  }
+  });
 }
 
 function findCSVFiles(directory) {
@@ -105,7 +186,7 @@ function findCSVFiles(directory) {
   return csvFiles;
 }
 
-function main() {
+async function main() {
   console.log('=== CSV Decoder - UTF-8 Encoding Fixer ===\n');
 
   const currentDir = process.cwd();
@@ -129,9 +210,10 @@ function main() {
   let failCount = 0;
 
   for (const file of csvFiles) {
-    if (decodeCSVFile(file)) {
+    try {
+      await decodeCSVFile(file);
       successCount++;
-    } else {
+    } catch (error) {
       failCount++;
     }
   }
